@@ -872,20 +872,19 @@ class Schema(metaclass=SchemaMeta):
             partial = self.partial
         # Run preprocessors
         if self._hooks[PRE_LOAD]:
-            try:
-                processed_data = self._invoke_load_processors(
-                    PRE_LOAD,
-                    data,
-                    many=many,
-                    original_data=data,
-                    partial=partial,
-                    unknown=unknown,
-                )
-            except ValidationError as err:
-                errors = err.normalized_messages()
-                result: list | dict | None = None
+            processed_data = self._invoke_load_processors(
+                PRE_LOAD,
+                data,
+                many=many,
+                original_data=data,
+                partial=partial,
+                unknown=unknown,
+                error_store=error_store,
+            )
         else:
             processed_data = data
+        errors = error_store.errors
+        result: list | dict | None = None
         if not errors:
             # Deserialize data
             result = self._deserialize(
@@ -925,17 +924,18 @@ class Schema(metaclass=SchemaMeta):
             errors = error_store.errors
             # Run post processors
             if not errors and postprocess and self._hooks[POST_LOAD]:
-                try:
-                    result = self._invoke_load_processors(
-                        POST_LOAD,
-                        result,
-                        many=many,
-                        original_data=data,
-                        partial=partial,
-                        unknown=unknown,
-                    )
-                except ValidationError as err:
-                    errors = err.normalized_messages()
+                processed_result = self._invoke_load_processors(
+                    POST_LOAD,
+                    result,
+                    many=many,
+                    original_data=data,
+                    partial=partial,
+                    unknown=unknown,
+                    error_store=error_store,
+                )
+                errors = error_store.errors
+                if not errors:
+                    result = processed_result
         if errors:
             exc = ValidationError(errors, data=data, valid_data=result)
             self.handle_error(exc, data, many=many, partial=partial)
@@ -1099,6 +1099,7 @@ class Schema(metaclass=SchemaMeta):
         original_data,
         partial: bool | types.StrSequenceOrSet | None,
         unknown: types.UnknownOption | None,
+        error_store: ErrorStore,
     ):
         # This has to invert the order of the dump processors, so run the pass_collection
         # processors first.
@@ -1110,7 +1111,11 @@ class Schema(metaclass=SchemaMeta):
             original_data=original_data,
             partial=partial,
             unknown=unknown,
+            error_store=error_store,
         )
+        # A collection-level error means the data cannot be processed any further.
+        if error_store.errors:
+            return data
         return self._invoke_processors(
             tag,
             pass_collection=False,
@@ -1119,6 +1124,7 @@ class Schema(metaclass=SchemaMeta):
             original_data=original_data,
             partial=partial,
             unknown=unknown,
+            error_store=error_store,
         )
 
     def _invoke_field_validators(self, *, error_store: ErrorStore, data, many: bool):
@@ -1218,6 +1224,18 @@ class Schema(metaclass=SchemaMeta):
                     unknown=unknown,
                 )
 
+    @staticmethod
+    def _store_processor_error(
+        error: ValidationError, error_store: ErrorStore, index: int | None = None
+    ) -> None:
+        """Store a `ValidationError` raised by a load processor in ``error_store``.
+
+        Processors are dispatched outside of `ErrorStore`, so their errors must be
+        stored explicitly to match the structure produced by field-level validation
+        (i.e. keyed by the index of the item within a collection).
+        """
+        error_store.store_error(error.messages, error.field_name, index=index)
+
     def _invoke_processors(
         self,
         tag: str,
@@ -1226,8 +1244,13 @@ class Schema(metaclass=SchemaMeta):
         data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
         many: bool,
         original_data=None,
+        error_store: ErrorStore | None = None,
         **kwargs,
     ):
+        # Items that already failed a processor are left as-is and skipped by the
+        # remaining processors, mirroring how field-level validation drops invalid
+        # values instead of letting them cascade into unrelated errors.
+        failed_indices: set[int] = set()
         for attr_name, hook_many, processor_kwargs in self._hooks[tag]:
             if hook_many != pass_collection:
                 continue
@@ -1236,17 +1259,58 @@ class Schema(metaclass=SchemaMeta):
             pass_original = processor_kwargs.get("pass_original", False)
 
             if many and not pass_collection:
-                if pass_original:
-                    data = [
-                        processor(item, original, many=many, **kwargs)
-                        for item, original in zip_longest(data, original_data)
-                    ]
+                if error_store is None:
+                    if pass_original:
+                        data = [
+                            processor(item, original, many=many, **kwargs)
+                            for item, original in zip_longest(data, original_data)
+                        ]
+                    else:
+                        data = [processor(item, many=many, **kwargs) for item in data]
                 else:
-                    data = [processor(item, many=many, **kwargs) for item in data]
+                    # Store errors per row index, like field-level validation does,
+                    # so that errors from all invalid rows are reported.
+                    if pass_original:
+                        pairs = list(zip_longest(data, original_data))
+                    else:
+                        pairs = [(item, None) for item in data]
+                    processed_data: list[typing.Any] = []
+                    for index, (item, original) in enumerate(pairs):
+                        if index in failed_indices:
+                            processed_data.append(item)
+                            continue
+                        try:
+                            processed_data.append(
+                                processor(item, original, many=many, **kwargs)
+                                if pass_original
+                                else processor(item, many=many, **kwargs)
+                            )
+                        except ValidationError as error:
+                            failed_indices.add(index)
+                            self._store_processor_error(
+                                error,
+                                error_store,
+                                index=index if self.opts.index_errors else None,
+                            )
+                            processed_data.append(item)
+                    data = processed_data
             elif pass_original:
-                data = processor(data, original_data, many=many, **kwargs)
-            else:
+                if error_store is None:
+                    data = processor(data, original_data, many=many, **kwargs)
+                else:
+                    try:
+                        data = processor(data, original_data, many=many, **kwargs)
+                    except ValidationError as error:
+                        self._store_processor_error(error, error_store)
+                        break
+            elif error_store is None:
                 data = processor(data, many=many, **kwargs)
+            else:
+                try:
+                    data = processor(data, many=many, **kwargs)
+                except ValidationError as error:
+                    self._store_processor_error(error, error_store)
+                    break
         return data
 
 

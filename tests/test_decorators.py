@@ -836,6 +836,138 @@ def test_decorator_error_handling_with_load_dict_error(decorator):
     schema.dump(object())
 
 
+@pytest.mark.parametrize("decorator", [pre_load, post_load])
+def test_load_processor_errors_match_field_errors_with_many(decorator):
+    """Errors from load processors are indexed and aggregated like field errors."""
+    data = [{"foo": 42}, {"foo": 1}, {"foo": 11}, {"foo": 2}]
+
+    class FieldSchema(Schema):
+        foo = fields.Int(validate=validate.Range(min=10))
+
+    class ProcessorSchema(Schema):
+        foo = fields.Int()
+
+        @decorator
+        def check(self, item, **kwargs):
+            if item["foo"] < 10:
+                raise ValidationError({"foo": ["too small"]})
+            return item
+
+    # Field-level errors: indexed by position, one entry per bad row.
+    with pytest.raises(ValidationError) as field_exc:
+        FieldSchema().load(data, many=True)
+    field_messages = field_exc.value.messages
+    assert set(field_messages) == {1, 3}
+    assert all(list(item) == ["foo"] for item in field_messages.values())
+
+    # Processor errors: same indexed structure, one entry per bad row.
+    with pytest.raises(ValidationError) as proc_exc:
+        ProcessorSchema().load(data, many=True)
+    proc_messages = proc_exc.value.messages
+    assert proc_messages == {1: {"foo": ["too small"]}, 3: {"foo": ["too small"]}}
+    # Same nesting shape as field-level errors.
+    assert set(field_messages) == set(proc_messages)
+
+    # Single-item mode keeps the unindexed structure.
+    with pytest.raises(ValidationError) as exc:
+        ProcessorSchema().load({"foo": 1})
+    assert exc.value.messages == {"foo": ["too small"]}
+
+
+@pytest.mark.parametrize("decorator", [pre_load, post_load])
+def test_load_processor_errors_are_aggregated_for_many(decorator):
+    class MySchema(Schema):
+        foo = fields.Int()
+
+        @decorator
+        def check(self, item, **kwargs):
+            if item["foo"] < 10:
+                raise ValidationError({"foo": ["too small"]})
+            return item
+
+    data = [{"foo": 1}, {"foo": 42}, {"foo": 2}, {"foo": 3}]
+    with pytest.raises(ValidationError) as exc:
+        MySchema().load(data, many=True)
+    assert exc.value.messages == {
+        0: {"foo": ["too small"]},
+        2: {"foo": ["too small"]},
+        3: {"foo": ["too small"]},
+    }
+
+
+@pytest.mark.parametrize("decorator", [pre_load, post_load])
+def test_load_processor_errors_are_aggregated_within_a_row(decorator):
+    class MySchema(Schema):
+        foo = fields.Int()
+        bar = fields.Int()
+
+        @decorator
+        def check(self, item, **kwargs):
+            errors = {}
+            if item["foo"] < 10:
+                errors["foo"] = ["too small"]
+            if item["bar"] < 10:
+                errors["bar"] = ["too small"]
+            if errors:
+                raise ValidationError(errors)
+            return item
+
+    with pytest.raises(ValidationError) as exc:
+        MySchema().load([{"foo": 1, "bar": 2}, {"foo": 11, "bar": 12}], many=True)
+    assert exc.value.messages == {0: {"foo": ["too small"], "bar": ["too small"]}}
+
+
+@pytest.mark.parametrize("decorator", [pre_load, post_load])
+def test_load_processor_errors_respect_index_errors_option(decorator):
+    class NoIndexSchema(Schema):
+        foo = fields.Int()
+
+        class Meta:
+            index_errors = False
+
+        @decorator
+        def check(self, item, **kwargs):
+            if item["foo"] < 10:
+                raise ValidationError({"foo": ["too small"]})
+            return item
+
+    with pytest.raises(ValidationError) as exc:
+        NoIndexSchema().load([{"foo": 1}, {"foo": 2}], many=True)
+    assert exc.value.messages == {"foo": ["too small", "too small"]}
+
+
+def test_pre_load_errors_skip_deserialization_and_post_load():
+    class MySchema(Schema):
+        foo = fields.Int()
+
+        @pre_load
+        def check_pre(self, item, **kwargs):
+            if item["foo"] < 10:
+                raise ValidationError({"foo": ["pre too small"]})
+            return item
+
+        @post_load
+        def check_post(self, item, **kwargs):
+            raise ValidationError({"foo": ["post should not run"]})
+
+    with pytest.raises(ValidationError) as exc:
+        MySchema().load([{"foo": 1}, {"foo": 11}], many=True)
+    assert exc.value.messages == {0: {"foo": ["pre too small"]}}
+
+
+def test_post_load_is_not_run_when_field_errors_exist():
+    class MySchema(Schema):
+        foo = fields.Int(validate=validate.Range(min=0))
+
+        @post_load
+        def check_post(self, item, **kwargs):
+            raise ValidationError({"foo": ["post should not run"]})
+
+    with pytest.raises(ValidationError) as exc:
+        MySchema().load([{"foo": -1}], many=True)
+    assert exc.value.messages == {0: {"foo": ["Must be greater than or equal to 0."]}}
+
+
 @pytest.mark.parametrize("decorator", [pre_dump, post_dump])
 def test_decorator_error_handling_with_dump(decorator):
     class ExampleSchema(Schema):

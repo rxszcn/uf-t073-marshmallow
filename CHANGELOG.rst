@@ -1,6 +1,15 @@
 Changelog
 =========
 
+4.4.1 (unreleased)
+------------------
+
+Bug fixes:
+
+- Errors raised in ``pre_load`` and ``post_load`` processors when loading with
+  ``many=True`` are now keyed by item index and aggregated across items, matching
+  the structure of field-level validation errors.
+
 4.4.0 (2026-11-03)
 ------------------
 
